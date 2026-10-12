@@ -206,6 +206,13 @@ def _taux_cumules_avant_le_jour(passe: pd.DataFrame, cles: list[str], m: float) 
     return cumul[["taux"]].reset_index()
 
 
+def taux_figes(passe: pd.DataFrame, cles: list[str], prior: float, m: float = 50) -> pd.DataFrame:
+    """Taux lissé par catégorie, calculé sur tous les vols de `passe` (statistiques figées)."""
+    stats = passe.groupby(cles, observed=True)["RETARD"].agg(["sum", "count"])
+    stats["taux"] = (stats["sum"] + m * prior) / (stats["count"] + m)
+    return stats[["taux"]].reset_index()
+
+
 def ajouter_taux_historiques(df: pd.DataFrame, date_coupure, m: float = 50) -> pd.DataFrame:
     """Ajoute les colonnes TAUX_HIST_* sans aucune fuite de données.
 
@@ -228,9 +235,8 @@ def ajouter_taux_historiques(df: pd.DataFrame, date_coupure, m: float = 50) -> p
         valeurs_train = df.loc[avant, cles + ["DATE"]].merge(cumul, on=cles + ["DATE"], how="left")["taux"]
 
         # b) Validation / test : statistiques figées à la date de coupure
-        stats = passe.groupby(cles, observed=True)["RETARD"].agg(["sum", "count"])
-        stats["taux"] = (stats["sum"] + m * prior_fige) / (stats["count"] + m)
-        valeurs_futur = df.loc[~avant, cles].merge(stats[["taux"]].reset_index(), on=cles, how="left")["taux"]
+        stats = taux_figes(passe, cles, prior_fige, m)
+        valeurs_futur = df.loc[~avant, cles].merge(stats, on=cles, how="left")["taux"]
 
         df[nom] = np.nan
         df.loc[avant, nom] = valeurs_train.to_numpy()
@@ -285,7 +291,8 @@ def regrouper_aeroports_rares(df: pd.DataFrame, masque_train: pd.Series, top: in
     """Regroupe les aéroports hors des `top` plus fréquents **de l'entraînement** dans « AUTRE »."""
     df = df.copy()
     for col in ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]:
-        garde = df.loc[masque_train, col].value_counts().head(top).index
+        comptes = df.loc[masque_train, col].value_counts()
+        garde = comptes[comptes > 0].head(top).index  # value_counts liste aussi les catégories absentes
         valeurs = df[col].astype(str).where(df[col].isin(garde), "AUTRE")
         df[col] = pd.Categorical(valeurs, categories=sorted(set(map(str, garde))) + ["AUTRE"])
     return df

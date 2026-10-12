@@ -120,7 +120,7 @@ def erreurs_par_segment(df: pd.DataFrame, y, proba, seuil: float, col: str,
                         min_vols: int = 2000) -> pd.DataFrame:
     """Qualité du modèle par segment : taux d'erreur, retards manqués, fausses alertes, ROC-AUC."""
     from sklearn.metrics import roc_auc_score
-    d = pd.DataFrame({"seg": df[col].to_numpy(), "y": np.asarray(y), "p": np.asarray(proba)})
+    d = pd.DataFrame({"seg": df[col].reset_index(drop=True), "y": np.asarray(y), "p": np.asarray(proba)})
     d["pred"] = (d["p"] >= seuil).astype(int)
 
     def resume(g):
