@@ -1,5 +1,7 @@
 # Données : jamais sur Git (téléchargées avec kagglehub ou placées à la main ici)
-data/
+# On versionne seulement le dossier vide (.gitkeep) pour qu'il existe après un clone
+data/*
+!data/.gitkeep
 
 # Environnement Python
 .venv/
