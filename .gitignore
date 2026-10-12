@@ -1,0 +1,12 @@
+# Données : jamais sur Git (téléchargées avec kagglehub ou placées à la main ici)
+data/
+
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Système
+.DS_Store
