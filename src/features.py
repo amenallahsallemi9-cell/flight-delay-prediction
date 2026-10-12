@@ -171,3 +171,121 @@ def ajouter_variables_calendrier(df: pd.DataFrame) -> pd.DataFrame:
     jours = pd.Series((ecart / np.timedelta64(1, "D")).astype("int16"), index=dates)
     df["JOURS_FERIE"] = df["DATE"].map(jours).astype("int16")
     return df
+
+
+# ---------------------------------------------------------------------------
+# 3. Taux de retard historiques (encodage par la cible, sans fuite)
+# ---------------------------------------------------------------------------
+# Pour chaque aéroport, compagnie et ligne, on calcule la part de vols en retard
+# **dans le passé**. Deux pièges à éviter :
+#   1. utiliser le résultat du vol lui-même ou de vols futurs → fuite de données ;
+#   2. faire confiance à une catégorie vue 3 fois (« 2 retards sur 3 = 67 % ») → bruit.
+# Le 2e point est traité par un lissage bayésien (m-estimate) :
+#       taux_lissé = (retards + m × taux_global) / (vols + m)
+# Avec peu de vols, on reste proche du taux global ; avec beaucoup, on suit les données.
+
+GROUPES_HISTORIQUES = {
+    "TAUX_HIST_ORIGINE": ["ORIGIN_AIRPORT"],
+    "TAUX_HIST_DESTINATION": ["DESTINATION_AIRPORT"],
+    "TAUX_HIST_COMPAGNIE": ["AIRLINE"],
+    "TAUX_HIST_LIGNE": ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"],
+}
+
+
+def _taux_cumules_avant_le_jour(passe: pd.DataFrame, cles: list[str], m: float) -> pd.DataFrame:
+    """Taux lissé par (clé, jour) calculé avec les vols **strictement antérieurs** à ce jour."""
+    # Taux global du passé, jour par jour (sert d'a priori pour le lissage)
+    glob = passe.groupby("DATE")["RETARD"].agg(["sum", "count"]).sort_index()
+    glob_avant = glob.cumsum() - glob  # cumul exclusif : uniquement les jours précédents
+    prior = (glob_avant["sum"] / glob_avant["count"].replace(0, np.nan)).rename("prior")
+
+    jour = passe.groupby(cles + ["DATE"], observed=True)["RETARD"].agg(["sum", "count"]).sort_index()
+    cumul = jour.groupby(level=cles, observed=True).cumsum() - jour  # exclut le jour même
+    cumul = cumul.join(prior, on="DATE")
+    cumul["taux"] = (cumul["sum"] + m * cumul["prior"]) / (cumul["count"] + m)
+    return cumul[["taux"]].reset_index()
+
+
+def ajouter_taux_historiques(df: pd.DataFrame, date_coupure, m: float = 50) -> pd.DataFrame:
+    """Ajoute les colonnes TAUX_HIST_* sans aucune fuite de données.
+
+    - Vols **avant** `date_coupure` (entraînement) : taux calculé sur les vols des jours
+      **précédents** uniquement (fenêtre cumulée qui s'arrête la veille).
+    - Vols **à partir de** `date_coupure` (validation / test) : taux **figé** à la date de
+      coupure, calculé sur tout l'entraînement. Le modèle n'utilise donc jamais la cible des
+      vols qu'il doit prédire, ni celle des vols situés entre la coupure et le départ.
+    - Catégorie jamais vue : taux global (prior).
+    """
+    date_coupure = pd.Timestamp(date_coupure)
+    df = df.copy()
+    avant = df["DATE"] < date_coupure
+    passe = df.loc[avant, ["DATE", "RETARD", "AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]]
+    prior_fige = passe["RETARD"].mean()
+
+    for nom, cles in GROUPES_HISTORIQUES.items():
+        # a) Entraînement : fenêtre cumulée jusqu'à la veille
+        cumul = _taux_cumules_avant_le_jour(passe, cles, m)
+        valeurs_train = df.loc[avant, cles + ["DATE"]].merge(cumul, on=cles + ["DATE"], how="left")["taux"]
+
+        # b) Validation / test : statistiques figées à la date de coupure
+        stats = passe.groupby(cles, observed=True)["RETARD"].agg(["sum", "count"])
+        stats["taux"] = (stats["sum"] + m * prior_fige) / (stats["count"] + m)
+        valeurs_futur = df.loc[~avant, cles].merge(stats[["taux"]].reset_index(), on=cles, how="left")["taux"]
+
+        df[nom] = np.nan
+        df.loc[avant, nom] = valeurs_train.to_numpy()
+        df.loc[~avant, nom] = valeurs_futur.fillna(prior_fige).to_numpy()
+        df[nom] = df[nom].astype("float32")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. Séparation temporelle et variables du modèle
+# ---------------------------------------------------------------------------
+CAT = ["AIRLINE", "ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]
+NUM_BASE = ["MONTH", "DAY_OF_WEEK", "JOUR_ANNEE", "HEURE_DEP", "HEURE_ARR", "JOURS_FERIE",
+            "DISTANCE", "SCHEDULED_TIME", "TRAFIC_HEURE"]
+NUM_HIST = list(GROUPES_HISTORIQUES)
+
+MOIS_TRAIN, MOIS_TEST = range(1, 9), [9, 11, 12]
+DEBUT_VALIDATION, DEBUT_TEST = "2015-08-01", "2015-09-01"
+
+
+def separer_temps(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Masques booléens de la séparation temporelle (jamais aléatoire).
+
+    La période d'entraînement va de janvier à août ; sa fin (août) sert de validation :
+    - entrainement : janvier → juillet (apprentissage des paramètres)
+    - validation   : août (arrêt anticipé, choix du seuil)
+    - test         : septembre, novembre, décembre (octobre n'est pas utilisé pour le test)
+    """
+    d = df["DATE"]
+    return {
+        "entrainement": d < DEBUT_VALIDATION,
+        "validation": (d >= DEBUT_VALIDATION) & (d < DEBUT_TEST),
+        "test": df["MONTH"].isin(MOIS_TEST),
+    }
+
+
+def construire_jeu_modele(df: pd.DataFrame, m: float = 50) -> pd.DataFrame:
+    """Ajoute les taux historiques et regroupe les aéroports rares, sans fuite.
+
+    - entraînement et validation : taux avec coupure au 1er août (la validation ne voit que
+      l'historique de janvier à juillet, comme le modèle) ;
+    - test : taux figés au 1er septembre (au moment de prédire, on connaît aussi les retards
+      d'août, mais rien de septembre ni après).
+    """
+    sep = separer_temps(df)
+    jeu = ajouter_taux_historiques(df, DEBUT_VALIDATION, m)
+    jeu.loc[sep["test"], NUM_HIST] = ajouter_taux_historiques(df, DEBUT_TEST, m).loc[sep["test"], NUM_HIST]
+    return regrouper_aeroports_rares(jeu, sep["entrainement"])
+
+
+def regrouper_aeroports_rares(df: pd.DataFrame, masque_train: pd.Series, top: int = 100) -> pd.DataFrame:
+    """Regroupe les aéroports hors des `top` plus fréquents **de l'entraînement** dans « AUTRE »."""
+    df = df.copy()
+    for col in ["ORIGIN_AIRPORT", "DESTINATION_AIRPORT"]:
+        garde = df.loc[masque_train, col].value_counts().head(top).index
+        valeurs = df[col].astype(str).where(df[col].isin(garde), "AUTRE")
+        df[col] = pd.Categorical(valeurs, categories=sorted(set(map(str, garde))) + ["AUTRE"])
+    return df
